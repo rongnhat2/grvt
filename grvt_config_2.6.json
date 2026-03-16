@@ -1,0 +1,34 @@
+{
+  "api_key": "enter your api key",
+  "signer_private_key": "enter your signer private key",
+  "sub_account_id": "enter your sub account id",
+  "instrument": "enter your instrument",
+  "env": "testnet",
+
+  "order_size": 0.002,
+  "tick_size": 0.5,
+  "order_expiry_h": 1.0,
+  "dry_run": false,
+
+  "trade_size_pct": 0.1,
+  "max_exposure_pct": 0.5,
+  "quote_offset_ticks": 0,
+  "stale_bps": 5.0,
+
+  "hard_loss_pct": 0.005,
+  "max_position_notional": 500.0,
+
+  "cycle_sleep_sec": 2.0,
+  "session_check_sec": 300,
+  "cancel_retry_count": 3,
+  "cancel_retry_delay_sec": 0.25,
+  "emergency_close_delay_sec": 0.5,
+  "emergency_verify_sleep_sec": 1.0,
+  "startup_cancel_sleep_sec": 0.5,
+  "no_price_wait_sec": 3,
+  "after_emergency_sleep_sec": 2,
+
+  "close_sec": 5,
+  "close_chase_ticks": 3,
+  "close_max_chase_ticks": 10
+}
