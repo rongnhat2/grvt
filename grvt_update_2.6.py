@@ -174,10 +174,13 @@ def sign_order(account, domain_data, sub_account_id, is_market, time_in_force,
     cs     = (raw_cs // lot) * lot
     if cs <= 0:
         raise ValueError(f"contractSize={cs} after lot rounding (raw={raw_cs}, lot={lot})")
+    # Market orders must sign with limitPrice=0 — sending any other value causes
+    # "Signature does not match payload" because the API always sends limit_price="0"
+    signed_limit_price = 0 if is_market else int(Decimal(str(limit_price)) * Decimal(str(PRICE_MULTIPLIER)))
     legs = [{
         "assetID":          instr_meta["instrument_hash"],
         "contractSize":     cs,
-        "limitPrice":       int(Decimal(str(limit_price)) * Decimal(str(PRICE_MULTIPLIER))),
+        "limitPrice":       signed_limit_price,
         "isBuyingContract": is_buying_asset,
     }]
     message_data = {
@@ -228,6 +231,11 @@ class Config:
 
         # Quote placement: how many ticks to offset from best bid/ask
         self.quote_offset_ticks = 0          # 0 = join the best bid/ask directly
+
+        # Close order chase settings
+        self.close_sec             = 5.0   # reprice close order every N seconds
+        self.close_chase_ticks     = 3     # chase up to N ticks against us per reprice
+        self.close_max_chase_ticks = 10    # market sell if total ticks chased exceeds this
 
         # Hard risk limits
         self.hard_loss_pct      = 0.005      # emergency market close if unrealized loss > 0.5% of equity
@@ -300,6 +308,11 @@ class GRVTClient:
         url = f"{base}{path}"
         try:
             r = self.sess.post(url, json=data, timeout=10)
+            if r.status_code in (401, 403):
+                # Session expired — re-login and retry once
+                log.warning(f"  {r.status_code} on {path} — re-logging in and retrying")
+                self._login()
+                r = self.sess.post(url, json=data, timeout=10)
             r.raise_for_status()
             return r.json()
         except requests.HTTPError:
@@ -330,7 +343,16 @@ class GRVTClient:
 
     def get_positions(self, sub_id: str) -> List[dict]:
         raw = self._post(self.trades, "/full/v1/positions", {"sub_account_id": str(sub_id)})
-        return raw.get("positions", [])
+        if not getattr(self, "_positions_logged", False):
+            log.info(f"[POSITIONS DEBUG] raw={str(raw)[:400]}")
+            self._positions_logged = True
+        # Handle both {"positions": [...]} and {"result": {"positions": [...]}} and {"result": [...]}
+        if isinstance(raw, list):
+            return raw
+        result = raw.get("result", raw)
+        if isinstance(result, list):
+            return result
+        return result.get("positions", raw.get("positions", []))
 
     def get_open_orders(self, sub_id: str) -> Dict[str, dict]:
         raw = self._post(self.trades, "/full/v1/open_orders", {"sub_account_id": str(sub_id)})
@@ -445,6 +467,10 @@ class MarketMaker:
         # Track entry price and time for trade P&L logging
         self._entry_px = 0.0
         self._entry_ts = 0.0
+
+        # Close order chase tracking
+        self._close_ticks_chased = 0
+        self._last_close_reprice = 0.0
 
     # ── Nonce ─────────────────────────────────────────────────────────────────
     def _next_nonce(self) -> int:
@@ -738,8 +764,9 @@ class MarketMaker:
             else:
                 ticks_moved = round((target_px - self.close_mo.price) / tick)
 
-            if ticks_moved > self.cfg.close_chase_ticks:
-                # Price moved too far against us in one step — market sell now
+            # Only trigger if price moved against us (ticks_moved > 0)
+            # Use close_chase_ticks as max adverse ticks per reprice cycle
+            if ticks_moved > self.cfg.close_chase_ticks > 0:
                 log.warning(f"  Price moved {ticks_moved} ticks against close — market selling")
                 self._cancel(self.close_mo, confirm=True)
                 self.close_mo = None
@@ -803,6 +830,24 @@ class MarketMaker:
         def _stop(sig, _):
             log.info("Shutting down — cancelling all orders")
             self.client.cancel_all(self.cfg.sub_account_id, self.cfg.instrument)
+            # Wait longer for exchange to process cancels and settle any partial fills
+            time.sleep(2.0)
+            # Force fresh position sync from API — do NOT trust self.pos (may be stale)
+            self._sync_pos()
+            log.info(f"  Post-cancel position: {self.pos.size:+.6f} @ {self.pos.avg_entry:.2f}")
+            if not self.pos.is_flat:
+                log.warning(f"  Open position on shutdown: {self.pos.size:+.6f} — market closing")
+                ticker = self.client.get_ticker(self.cfg.instrument)
+                cur_px = ticker["mark_price"] or ticker["mid_price"]
+                self._emergency_close(cur_px, "shutdown")
+                time.sleep(2.0)
+                self._sync_pos()
+                if self.pos.is_flat:
+                    log.info("  Shutdown close confirmed flat ✓")
+                else:
+                    log.error(f"  Shutdown close FAILED — pos still {self.pos.size:+.6f}")
+            else:
+                log.info("  Position flat — clean shutdown ✓")
             sys.exit(0)
         signal.signal(signal.SIGINT,  _stop)
         signal.signal(signal.SIGTERM, _stop)
@@ -821,6 +866,24 @@ class MarketMaker:
             self.client.cancel_all(self.cfg.sub_account_id, self.cfg.instrument)
             time.sleep(self.cfg.startup_cancel_sleep_sec)
         except Exception: pass
+
+        # Startup cleanup: if there's a leftover position from a previous session, close it now
+        try:
+            self._get_balances()
+            self._sync_pos()
+            if not self.pos.is_flat:
+                log.warning(f"  Startup: found open position {self.pos.size:+.6f} @ {self.pos.avg_entry:.2f} — closing before quoting")
+                ticker = self.client.get_ticker(self.cfg.instrument)
+                cur_px = ticker["mark_price"] or ticker["mid_price"]
+                self._emergency_close(cur_px, "startup_cleanup")
+                time.sleep(2.0)
+                self._sync_pos()
+                if self.pos.is_flat:
+                    log.info("  Startup cleanup: position closed ✓")
+                else:
+                    log.error(f"  Startup cleanup FAILED — pos still {self.pos.size:+.6f}, proceeding anyway")
+        except Exception as e:
+            log.warning(f"  Startup cleanup error: {e}")
 
         cycle = 0
         while self._running:
@@ -859,31 +922,48 @@ class MarketMaker:
                         self._emergency_close(cur_px, f"hard_loss {loss_pct*100:.2f}%")
                         time.sleep(self.cfg.after_emergency_sleep_sec); continue
 
-                # Maintain two-sided quotes (bid + ask) every cycle.
-                # _refresh_quotes will skip a side automatically if at exposure limit.
-                self._refresh_quotes(ticker, open_api)
-
-                # When a position is open (one quote got filled), manage the close order
-                # on the opposite side to return to flat.
-                if not self.pos.is_flat:
-                    self._refresh_close(ticker, open_api)
-                    # Cancel any remaining quote in the same direction as the open position
-                    # to avoid adding more exposure in the filled direction.
-                    filled_side = "buy" if self.pos.is_long else "sell"
-                    if self.quotes[filled_side]:
-                        log.info(f"  Cancelling {filled_side} quote (already filled that side)")
-                        self._cancel(self.quotes[filled_side])
-                        self.quotes[filled_side] = None
-                else:
-                    # Position is flat — clean up any stale close order
+                # ── Pat's business logic ────────────────────────────────
+                # Goal: maximize round trips per hour (quote → fill → flatten → repeat)
+                # Rule: NEVER quote and manage inventory at the same time.
+                #
+                #   FLAT     → place bid + ask, wait for a fill
+                #   NON-FLAT → cancel ALL open quotes, focus 100% on flattening
+                #              only return to quoting after position is flat again
+                #
+                # This ensures:
+                #   1. No additional exposure is added while holding inventory
+                #   2. Bot always prioritizes getting flat over capturing more spread
+                #   3. Inventory duration stays minimal → more cycles per hour
+                # ────────────────────────────────────────────────────────────
+                if self.pos.is_flat:
+                    # FLAT: normal two-sided quoting
+                    # Clean up any leftover close order first
                     if self.close_mo:
                         self._cancel(self.close_mo)
                         self.close_mo = None
-                    # Log completed round-trip
+                    # Log round-trip completion
                     if self._entry_px:
-                        log.info("  Position returned to flat")
+                        hold = time.time() - self._entry_ts if self._entry_ts else 0
+                        log.info(f"  ✓ Round trip complete — hold={hold:.1f}s entry={self._entry_px:.2f}")
                         self._entry_px = 0.0
                         self._entry_ts = 0.0
+                    # Place / refresh bid + ask
+                    self._refresh_quotes(ticker, open_api)
+
+                else:
+                    # NON-FLAT: cancel ALL open quotes, only manage close order
+                    # Do not add any new exposure while holding inventory
+                    for side in ("buy", "sell"):
+                        if self.quotes[side]:
+                            log.info(f"  Cancelling {side} quote — focusing on flatten")
+                            self._cancel(self.quotes[side])
+                            self.quotes[side] = None
+                    # Manage close order until flat
+                    self._refresh_close(ticker, open_api)
+                    # Record entry price first time position appears
+                    if not self._entry_px:
+                        self._entry_px = self.pos.avg_entry
+                        self._entry_ts = time.time()
 
                 # Record entry price the first time a position appears
                 if not self.pos.is_flat and not self._entry_px:
