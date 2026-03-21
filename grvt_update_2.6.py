@@ -522,7 +522,7 @@ class MarketMaker:
         if size < min_sz:
             log.warning(f"  Skip submit: size={size:.9f} < min_size={min_sz}")
             return None
-        if price > 0 and size * price < min_not:
+        if not reduce_only and price > 0 and size * price < min_not:
             log.warning(f"  Skip submit: notional={size*price:.2f} < min_notional={min_not}")
             return None
 
