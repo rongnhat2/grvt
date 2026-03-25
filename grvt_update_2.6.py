@@ -308,11 +308,6 @@ class GRVTClient:
         url = f"{base}{path}"
         try:
             r = self.sess.post(url, json=data, timeout=10)
-            if r.status_code in (401, 403):
-                # Session expired — re-login and retry once
-                log.warning(f"  {r.status_code} on {path} — re-logging in and retrying")
-                self._login()
-                r = self.sess.post(url, json=data, timeout=10)
             r.raise_for_status()
             return r.json()
         except requests.HTTPError:
@@ -788,8 +783,7 @@ class MarketMaker:
                 self._last_close_reprice = now
 
         if self.close_mo is None:
-            # Cap at actual position size — reduce_only cannot exceed what we hold
-            qty = min(self._valid_size(abs(self.pos.size), target_px), abs(self.pos.size))
+            qty = self._valid_size(abs(self.pos.size), target_px)
             mo  = self._submit(
                 is_buying   = self.pos.is_short,
                 price       = target_px,
